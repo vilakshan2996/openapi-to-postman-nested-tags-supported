@@ -14,6 +14,40 @@ let _ = require('lodash'),
     trace: true
   },
 
+  /**
+   * Helper function to create hierarchical folder structure for tags
+   * @param {Object} tree - The graph tree
+   * @param {Array} tagPath - Array of tag path segments
+   * @param {Object} tagDescMap - Map of tag descriptions
+   * @param {string} fullTag - The full tag name for description lookup
+   */
+  _createHierarchicalTagFolders = function (tree, tagPath, tagDescMap, fullTag) {
+    let currentPath = '';
+
+    _.forEach(tagPath, function (segment, index) {
+      let previousPath = currentPath;
+      currentPath = currentPath ? `${currentPath}/${segment}` : segment;
+      let nodeId = `path:${currentPath}`;
+
+      if (!tree.hasNode(nodeId)) {
+        tree.setNode(nodeId, {
+          type: 'folder',
+          meta: {
+            path: '',
+            name: segment,
+            description: index === tagPath.length - 1 ? tagDescMap[fullTag] || '' : ''
+          },
+          data: {}
+        });
+
+        // Connect to parent (root collection or parent folder)
+        let parentNode = index === 0 ? 'root:collection' : `path:${previousPath}`;
+        tree.setEdge(parentNode, nodeId);
+      }
+    });
+
+    return currentPath;
+  },
 
   _generateTreeFromPathsV2 = function (openapi, { includeDeprecated }) {
     /**
@@ -424,6 +458,81 @@ let _ = require('lodash'),
     return tree;
   },
 
+  /**
+   * Generate tree with hierarchical tag support (array order defines hierarchy)
+   * For each operation, the tags array defines the folder path: first tag is root, next is child, etc.
+   */
+  _generateTreeFromTagsWithHierarchy = function (openapi, { includeDeprecated }) {
+    let tree = new Graph(),
+      tagDescMap = _.reduce(openapi.tags, function (acc, data) {
+        acc[data.name] = data.description;
+        return acc;
+      }, {});
+
+    tree.setNode('root:collection', {
+      type: 'collection',
+      data: {},
+      meta: {}
+    });
+
+    // For each operation, create folders as per tags array order
+    _.forEach(openapi.paths, function (methods, path) {
+      _.forEach(methods, function (data, method) {
+        if (!ALLOWED_HTTP_METHODS[method]) {
+          return;
+        }
+        if (!includeDeprecated && data.deprecated) {
+          return;
+        }
+        if (data.tags && data.tags.length > 0) {
+          let tagPath = data.tags.slice().reverse();
+          let currentPath = '';
+          _.forEach(tagPath, function (tag, index) {
+            let previousPath = currentPath;
+            currentPath = currentPath ? `${currentPath}/${tag}` : tag;
+            let nodeId = `path:${currentPath}`;
+            if (!tree.hasNode(nodeId)) {
+              tree.setNode(nodeId, {
+                type: 'folder',
+                meta: {
+                  path: '',
+                  name: tag,
+                  description: tagDescMap[tag] || ''
+                },
+                data: {}
+              });
+              let parentNode = index === 0 ? 'root:collection' : `path:${previousPath}`;
+              tree.setEdge(parentNode, nodeId);
+            }
+          });
+          // Place the request in the deepest folder
+          tree.setNode(`path:${currentPath}:${path}:${method}`, {
+            type: 'request',
+            data: {},
+            meta: {
+              tagPath: data.tags,
+              path: path,
+              method: method
+            }
+          });
+          tree.setEdge(`path:${currentPath}`, `path:${currentPath}:${path}:${method}`);
+        } else {
+          // No tags: put at root
+          tree.setNode(`path:${path}:${method}`, {
+            type: 'request',
+            data: {},
+            meta: {
+              path: path,
+              method: method
+            }
+          });
+          tree.setEdge('root:collection', `path:${path}:${method}`);
+        }
+      });
+    });
+    return tree;
+  },
+
   _generateWebhookEndpoints = function (openapi, tree, { includeDeprecated }) {
     if (!_.isEmpty(openapi.webhooks)) {
       tree.setNode(`${PATH_WEBHOOK}:folder`, {
@@ -477,11 +586,13 @@ module.exports = function (openapi, { folderStrategy, includeWebhooks, includeDe
     case 'tags':
       skeletonTree = _generateTreeFromTags(openapi, { includeDeprecated });
       break;
-
+    case 'tagshierarchical':
+    case 'TagsHierarchical':
+      skeletonTree = _generateTreeFromTagsWithHierarchy(openapi, { includeDeprecated });
+      break;
     case 'paths':
       skeletonTree = _generateTreeFromPathsV2(openapi, { includeDeprecated });
       break;
-
     default:
       throw new Error('generateSkeletonTreeFromOpenAPI~folderStrategy not valid');
   }
